@@ -1,0 +1,212 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8"/>
+<meta name="viewport" content="width=device-width, initial-scale=1"/>
+<title>Magenta RT · Browser (Transformers.js / ONNX)</title>
+<style>
+  :root{ --bg:#fffdf3; --ink:#1c1917; --mut:#78716c; --amber:#f59e0b; --amber2:#fbbf24; --lime:#84cc16; --line:#e7e1c8; --card:#fffef9; }
+  *{ box-sizing:border-box; } body{ margin:0; font-family:"Segoe UI",-apple-system,sans-serif; color:var(--ink);
+    background:radial-gradient(900px 480px at 80% -5%, #fef3c7, var(--bg) 55%); min-height:100vh; }
+  .wrap{ max-width:680px; margin:0 auto; padding:30px 20px 60px; }
+  h1{ font-size:23px; margin:0 0 2px; font-weight:800; letter-spacing:-.4px; }
+  h1 .em{ background:linear-gradient(90deg,var(--amber),var(--lime)); -webkit-background-clip:text; background-clip:text; color:transparent; }
+  .sub{ color:var(--mut); font-size:13px; margin-bottom:22px; }
+  .card{ background:var(--card); border:1px solid var(--line); border-radius:16px; padding:18px; margin-bottom:14px; }
+  label{ font-size:12px; color:var(--mut); text-transform:uppercase; letter-spacing:.5px; display:block; margin-bottom:8px; }
+  .seg{ display:inline-flex; background:#fef9e7; border:1px solid var(--line); border-radius:999px; padding:3px; gap:2px; }
+  .seg button{ border:none; background:transparent; padding:7px 16px; border-radius:999px; font-weight:700; font-size:13px; color:var(--mut); cursor:pointer; }
+  .seg button.on{ background:linear-gradient(135deg,var(--amber2),var(--amber)); color:#3a2c05; }
+  .row{ display:flex; gap:18px; flex-wrap:wrap; align-items:flex-end; }
+  select,button.go{ font-family:inherit; font-weight:700; }
+  select{ padding:10px 12px; border-radius:10px; border:1.5px solid var(--line); background:#fff; font-size:15px; color:var(--ink); }
+  button.go{ padding:12px 26px; border:none; border-radius:999px; font-size:15px; color:#3a2c05;
+    background:linear-gradient(135deg,var(--amber2),var(--amber)); box-shadow:0 4px 14px #f59e0b55; cursor:pointer; }
+  button.go:disabled{ opacity:.5; cursor:default; }
+  .stat{ font-size:13px; color:var(--mut); margin-top:10px; min-height:18px; }
+  canvas{ width:100%; height:70px; display:block; border-radius:10px; background:#fffdf3; margin-top:10px; border:1px solid var(--line); }
+  #prog{ display:none; height:10px; background:#fef9e7; border:1px solid var(--line); border-radius:999px; overflow:hidden; margin-top:10px; }
+  #bar{ height:100%; width:0%; border-radius:999px; background:linear-gradient(90deg,var(--amber),var(--lime)); transition:width .15s; }
+  code{ background:#fef9e7; padding:1px 6px; border-radius:6px; font-size:12px; }
+  .badge{ font-size:11px; padding:2px 8px; border-radius:999px; background:#f7fee7; color:#3f6212; border:1px solid #d9f99d; }
+</style>
+</head>
+<body>
+<div class="wrap">
+  <h1>🍋 Magenta RT · <span class="em">in your browser</span></h1>
+  <div class="sub">Real-time music generation running fully client-side — ONNX Runtime Web (WebGPU / WASM). No server inference.</div>
+
+  <div class="card">
+    <div class="row">
+      <div><label>Backend</label><div class="seg" id="dev"><button data-v="webgpu" class="on">WebGPU</button><button data-v="wasm">WASM (CPU)</button></div></div>
+      <div><label>Precision</label><div class="seg" id="dtype"><button data-v="q8" class="on">int8</button><button data-v="q4">int4</button><button data-v="fp32">fp32</button></div></div>
+      <div><label>Model</label><div class="seg" id="size"><button data-v="small" class="on">small</button><button data-v="base">base</button></div></div>
+    </div>
+  </div>
+
+  <div class="card">
+    <label>Style</label>
+    <div class="row">
+      <select id="prompt"></select>
+      <button class="go" id="load">Load model</button>
+      <button class="go" id="play" disabled>▶ Play</button>
+      <button class="go" id="stop" disabled style="background:#2a2e45;color:#fff">■ Stop</button>
+      <span class="badge" id="rt"></span>
+    </div>
+    <div class="stat" id="stat">Pick a backend + precision and press <b>Load model</b>.</div>
+    <div id="prog"><div id="bar"></div></div>
+    <canvas id="viz" width="640" height="70"></canvas>
+  </div>
+</div>
+
+<script type="module">
+import * as ort from "https://cdn.jsdelivr.net/npm/onnxruntime-web@1.23.0/dist/ort.webgpu.min.mjs";
+ort.env.wasm.numThreads = navigator.hardwareConcurrency ? Math.min(4, navigator.hardwareConcurrency) : 2;
+
+const $ = id => document.getElementById(id);
+const REPO = sz => `https://huggingface.co/magenta-torch/magenta-rt-onnx-${sz}/resolve/main`;
+let cfg=null, S={}, EMB=null, QUANT=null, presets={}, sz="small", dev="webgpu", dtype="q8";
+
+// ── segmented controls ──
+function seg(id, set){ $(id).querySelectorAll("button").forEach(b=>b.onclick=()=>{
+  $(id).querySelectorAll("button").forEach(x=>x.classList.remove("on")); b.classList.add("on"); set(b.dataset.v); }); }
+seg("dev",v=>dev=v); seg("dtype",v=>dtype=v); seg("size",v=>{sz=v;});
+
+// ── fp16 -> f32 ──
+function f16(u){ const s=(u&0x8000)>>15,e=(u&0x7c00)>>10,f=u&0x03ff;
+  if(e===0) return (s?-1:1)*Math.pow(2,-14)*(f/1024);
+  if(e===31) return f?NaN:(s?-1:1)*Infinity;
+  return (s?-1:1)*Math.pow(2,e-15)*(1+f/1024); }
+function f16decode(b){ const u=new Uint16Array(b.buffer,b.byteOffset,b.byteLength>>1), o=new Float32Array(u.length); for(let i=0;i<u.length;i++)o[i]=f16(u[i]); return o; }
+function setBar(f){ $("bar").style.width=Math.min(100,Math.max(0,f*100)).toFixed(1)+"%"; }
+async function fetchBuf(url, onFrac){
+  let cache=null;
+  try{ cache=await caches.open("mrt-onnx-v1"); const hit=await cache.match(url);
+    if(hit){ onFrac&&onFrac(1); return new Uint8Array(await hit.arrayBuffer()); } }catch(e){}
+  const r=await fetch(url); if(!r.ok) throw new Error(r.status+" "+url.split("/").pop());
+  const total=+r.headers.get("content-length")||0, reader=r.body.getReader(), chunks=[]; let recv=0;
+  for(;;){ const {done,value}=await reader.read(); if(done)break; chunks.push(value); recv+=value.length; if(total&&onFrac)onFrac(recv/total); }
+  const buf=new Uint8Array(recv); let o=0; for(const c of chunks){buf.set(c,o);o+=c.length;}
+  if(cache){ try{ await cache.put(url, new Response(buf)); }catch(e){} }  // persist for next load
+  return buf;
+}
+
+// ── load ──
+$("load").onclick=async()=>{
+  $("load").disabled=true; $("prog").style.display="block"; setBar(0); $("stat").textContent=`loading ${sz} · ${dev} · ${dtype}…`;
+  const base=REPO(sz);
+  try{
+    cfg=await (await fetch(base+"/config.json")).json();
+    presets=await (await fetch(base+"/presets.json")).json();
+    $("prompt").innerHTML=Object.keys(presets).map(p=>`<option>${p}</option>`).join("");
+    const ep=dev==="webgpu"?["webgpu"]:["wasm"], suf=dtype==="fp32"?"":"."+dtype;
+    const g={encoder:"encoder",temporal:"temporal_step",depth:"depth_step",decoder:"spectrostream_decoder"};
+    const extMap=cfg.external_data||{};
+    // build download list: each graph .onnx (+ its external data) + the two fp16 tables
+    const items=[];
+    for(const k in g){
+      // decoder is Conv-based: int8 -> ConvInteger (unsupported in onnxruntime-web) -> always fp32
+      const fn = k==="decoder" ? "spectrostream_decoder.onnx" : `${g[k]}${suf}.onnx`;
+      items.push({id:"g_"+k, url:`${base}/onnx/${fn}`});
+      const df=extMap[fn]; if(df) items.push({id:"d_"+k, path:df, url:`${base}/onnx/${df}`}); }
+    items.push({id:"emb", url:base+"/onnx/token_embedding_fp16.bin"});
+    items.push({id:"quant", url:base+"/onnx/quantizer_fp16.bin"});
+    const N=items.length, bufs={};
+    const mb=b=>(b/1048576).toFixed(0);
+    for(let i=0;i<N;i++){ const it=items[i], name=it.url.split("/").pop();
+      bufs[it.id]=await fetchBuf(it.url, f=>{ setBar((i+f)/N); $("stat").textContent=`downloading ${name} — ${(f*100).toFixed(0)}% (${i+1}/${N})`; }); }
+    setBar(1); $("stat").textContent="compiling graphs…";
+    for(const k in g){ const opts={executionProviders:ep}, d=items.find(x=>x.id==="d_"+k);
+      if(d) opts.externalData=[{path:d.path, data:bufs["d_"+k]}];
+      S[k]=await ort.InferenceSession.create(bufs["g_"+k], opts); }
+    EMB=f16decode(bufs.emb); QUANT=f16decode(bufs.quant);
+    $("prog").style.display="none"; $("play").disabled=false;
+    $("stat").innerHTML=`ready · <code>${dev}</code> · <code>${dtype}</code> — press Play`;
+  }catch(e){ $("prog").style.display="none"; $("stat").textContent="load failed: "+e.message; $("load").disabled=false; }
+};
+
+// ── tensor helpers ──
+const NR=()=>cfg.num_reserved_tokens, CB=()=>cfg.codebook_size, Q=()=>cfg.num_codebooks, D=()=>cfg.model_dims;
+const i64=(arr,dims)=>new ort.Tensor("int64",BigInt64Array.from(arr.map(x=>BigInt(x))),dims);
+const f32=(arr,dims)=>new ort.Tensor("float32",arr instanceof Float32Array?arr:Float32Array.from(arr),dims);
+function emptyKV(L,nh,uph){ return f32(new Float32Array(0),[L,1,0,nh,uph]); }
+// trim KV time dim (axis 2) to last `keep`
+function trimKV(t,keep){ const [L,b,T,nh,uph]=t.dims; if(T<=keep) return t;
+  const per=nh*uph, src=t.data, out=new Float32Array(L*b*keep*per);
+  for(let l=0;l<L;l++) for(let j=0;j<keep;j++){ const so=(l*T+(T-keep+j))*per, dof=(l*keep+j)*per;
+    out.set(src.subarray(so,so+per),dof); } return f32(out,[L,b,keep,nh,uph]); }
+function gatherEmb(tok){ const d=D(); return f32(EMB.subarray(tok*d,(tok+1)*d),[1,1,d]); }
+
+// ── conditioning -> source ──
+async function encodeStyle(tokens){
+  const off=cfg.conditioning.cond_offset;
+  const vals=[...tokens, ...Array(128).fill(-1), -1, 20,10,8].map(v=>v+off);
+  const {source}=await S.encoder.run({cond:i64(vals,[1,1,vals.length])});
+  return source;
+}
+
+// ── per-frame generation (validated blueprint) ──
+let KV=null, prev=null, source=null;
+function reset(){ const t=cfg.temporal; KV={
+    sk:emptyKV(t.num_layers,t.num_heads,t.dim_per_head), sv:emptyKV(t.num_layers,t.num_heads,t.dim_per_head),
+    ck:emptyKV(t.num_layers,t.num_heads,t.dim_per_head), cv:emptyKV(t.num_layers,t.num_heads,t.dim_per_head)};
+  prev=i64(Array(Q()).fill(0),[1,1,Q()]); }
+function argmax(data,lo,hi){ let bi=lo,bv=data[lo]; for(let i=lo+1;i<hi;i++) if(data[i]>bv){bv=data[i];bi=i;} return bi; }
+function sampleTopk(data,lo,hi,temp,topk){ if(temp<=0)return argmax(data,lo,hi);
+  const idx=[]; for(let i=lo;i<hi;i++)idx.push(i); idx.sort((a,b)=>data[b]-data[a]);
+  const k=Math.min(topk,idx.length); let best=lo,bv=-1e9;
+  for(let j=0;j<k;j++){ const g=-Math.log(-Math.log(Math.random()+1e-10)); const v=data[idx[j]]+g*temp; if(v>bv){bv=v;best=idx[j];} } return best; }
+
+async function genFrame(temp,topk){
+  const d=cfg.depth, keep=cfg.temporal.max_past+1;
+  const r=await S.temporal.run({prev,self_k:KV.sk,self_v:KV.sv,cross_k:KV.ck,cross_v:KV.cv,source});
+  KV={sk:trimKV(r.new_self_k,keep),sv:trimKV(r.new_self_v,keep),ck:trimKV(r.new_cross_k,keep),cv:trimKV(r.new_cross_v,keep)};
+  let dk=emptyKV(d.num_layers,d.num_heads,d.dim_per_head), dv=emptyKV(d.num_layers,d.num_heads,d.dim_per_head);
+  let di=r.out; const toks=[], codes=[];
+  for(let q=0;q<Q();q++){
+    const dr=await S.depth.run({depth_input:di,depth_k:dk,depth_v:dv});
+    dk=dr.new_depth_k; dv=dr.new_depth_v;
+    const lo=NR()+q*CB(); const tok=sampleTopk(dr.logits.data,lo,lo+CB(),temp,topk);
+    toks.push(tok); codes.push((tok-NR())%CB()); di=gatherEmb(tok);
+  }
+  prev=i64(toks,[1,1,Q()]); return codes;   // [12] relative
+}
+// codes [F,12] -> embeddings [1,F,256] (gather+sum over 12 levels)
+function codesToEmb(frames){ const F=frames.length, dd=256, out=new Float32Array(F*dd);
+  for(let t=0;t<F;t++) for(let q=0;q<12;q++){ const c=frames[t][q], o=(q*1024+c)*dd;
+    for(let i=0;i<dd;i++) out[t*dd+i]+=QUANT[o+i]; } return f32(out,[1,F,dd]); }
+async function decode(frames){ const {waveform}=await S.decoder.run({embeddings:codesToEmb(frames)}); return waveform; }
+
+// ── Web Audio streaming ──
+let actx=null,analyser=null,nextT=0,playing=false,freq=null;
+function playWav(t){ const [b,n,c]=t.dims, data=t.data; const buf=actx.createBuffer(2,n,48000);
+  const L=buf.getChannelData(0),R=buf.getChannelData(1); for(let i=0;i<n;i++){L[i]=data[i*2];R[i]=data[i*2+1];}
+  const s=actx.createBufferSource(); s.buffer=buf; s.connect(analyser);
+  if(nextT<actx.currentTime+0.05)nextT=actx.currentTime+0.15; s.start(nextT); nextT+=n/48000; }
+function viz(){ const c=$("viz"),g=c.getContext("2d"),w=c.width,h=c.height; g.clearRect(0,0,w,h);
+  if(analyser){ analyser.getByteFrequencyData(freq); const bw=w/48;
+    for(let i=0;i<48;i++){ const v=freq[i*2]/255; g.fillStyle=`hsl(${70-v*40},85%,${45+v*15}%)`; g.fillRect(i*bw,h-v*h,bw-1,v*h);} }
+  requestAnimationFrame(viz); } viz();
+
+$("play").onclick=async()=>{
+  actx=new AudioContext({sampleRate:48000}); await actx.resume(); nextT=actx.currentTime+0.2;
+  analyser=actx.createAnalyser(); analyser.fftSize=128; analyser.connect(actx.destination); freq=new Uint8Array(analyser.frequencyBinCount);
+  $("play").disabled=true; $("stop").disabled=false; playing=true;
+  reset(); source=await encodeStyle(presets[$("prompt").value]);
+  const CHUNK=10; let done=0; const t0=performance.now();
+  while(playing){
+    const frames=[];
+    for(let i=0;i<CHUNK;i++){ if(!playing)break; frames.push(await genFrame(1.1,40)); }
+    if(!frames.length)break;
+    const wav=await decode(frames); playWav(wav); done+=CHUNK;
+    const sec=done/cfg.frames_per_second, rt=sec/((performance.now()-t0)/1000);
+    $("rt").textContent=`${rt.toFixed(2)}× realtime`; $("stat").textContent=`generating · ${sec.toFixed(1)}s`;
+    // re-steer if prompt changed
+    const sel=presets[$("prompt").value]; // (live: re-encode if changed)
+  }
+};
+$("stop").onclick=()=>{ playing=false; if(actx)actx.suspend(); $("play").disabled=false; $("stop").disabled=true; $("stat").textContent="stopped"; };
+$("prompt").onchange=async()=>{ if(playing&&source!==null) source=await encodeStyle(presets[$("prompt").value]); };
+</script>
+</body>
+</html>
