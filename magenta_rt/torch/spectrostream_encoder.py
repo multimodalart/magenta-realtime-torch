@@ -152,9 +152,13 @@ def rvq_encode(embeddings, quantizer_embedding, num_levels=12):
 
 
 def load_spectrostream_encoder(encoder_path, dtype=torch.float32):
+    # Encoder weights ship in the standalone resources/spectrostream/encoder.safetensors
+    # under params/encoder/ (NOT in the mrt2_*.safetensors checkpoint).
     w = {}
     with safe_open(str(encoder_path), "numpy") as f:
         for k in f.keys():
             if k.startswith("params/encoder/"):
                 w[k[len("params/encoder/"):]] = torch.from_numpy(np.asarray(f.get_tensor(k))).to(dtype)
+    if not w:
+        raise ValueError(f"No params/encoder/ weights in {encoder_path}")
     return SpectroStreamEncoder(w)

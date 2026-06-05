@@ -256,6 +256,37 @@ class MagentaRT2ForConditionalGeneration(MagentaRT2PreTrainedModel):
         new = wav[:, end - avail * FRAME_SAMPLES: end]
         return new, emitted + avail
 
+    def init_decode_state(self):
+        """Fresh state dict for streaming decode (decode_stream)."""
+        return {}
+
+    @torch.no_grad()
+    def prefill_f(self, dstate, source_frame, seed_codes):
+        """Teacher-force seed_codes [1,N,Q] (raw 0..codebook_size-1) through the
+        temporal transformer to populate its KV cache (native mlx_engine prefill
+        parity), so generation CONTINUES from the seed. Advances `dstate` in place.
+        Returns unique-code frames [1,N,Q] for the codec decoder."""
+        dec = self.depthformer.decoder
+        Q = self.config.num_codebooks
+        per_cb = (torch.arange(Q, device=seed_codes.device) * self.codebook_size
+                  + self.num_reserved_tokens).view(1, 1, Q)
+        unique = seed_codes.to(torch.long) + per_cb
+        N = unique.shape[1]
+        for step in range(max(0, N - 1)):
+            dec.step_f(dstate, source_frame, forced=unique[:, step:step + 1, :],
+                       temporal_step=self._temporal_step, depth_step=self._depth_step)
+        if N > 0:
+            dstate["prev"] = unique[:, N - 1:N, :]
+        return unique
+
+    def decode_stream(self, new_codes, state):
+        """Incremental codec decode of new token frames [b, t_new, Q] -> audio [b, N, 2].
+        FLOP-optimal stateful streaming (no overlap-save re-decode); bf16-equivalent to
+        _decode_stream/forward, with a 1-frame (40ms) decoder latency. `state` starts as {}."""
+        codes = convert_from_unique_codes(new_codes, self.codebook_size, self.num_reserved_tokens)
+        emb = codes_to_embeddings(codes, self.quant)
+        return self.codec.decode_streaming(emb.to(self._dt), state)
+
     # ---- forward: one teacher-forced pass (logits), for parity / training hooks ----
     def forward(self, style_tokens=None, target=None, source=None, **kwargs):
         """If `source` is given, returns per-frame logits for `target` [b,T,Q].

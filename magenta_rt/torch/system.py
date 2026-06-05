@@ -196,6 +196,42 @@ class MagentaRT2:
         new = wav[:, end - avail * FRAME_SAMPLES: end]
         return new, emitted + avail
 
+    def init_decode_state(self):
+        """Fresh state dict for streaming decode (decode_stream)."""
+        return {}
+
+    @torch.no_grad()
+    def prefill_f(self, dstate, source_frame, seed_codes):
+        """Teacher-force seed_codes [1,N,Q] (raw 0..codebook_size-1) through the
+        temporal transformer to populate its KV cache (native parity: mlx_engine
+        prefill loop). Advances `dstate` in place so generation CONTINUES from the
+        seed musically. Loops tokens[0..N-2] forcing each frame, then seeds prev =
+        tokens[N-1] without a model call (matches "about to predict frame N").
+        Returns unique-code frames [1,N,Q] for the codec decoder. `source_frame` is
+        masked-notes conditioning (next gen call supplies the user's real cond)."""
+        dec = self.model.decoder
+        Q = self.cfg.num_codebooks
+        # raw code -> global vocab id: code + NUM_RESERVED_TOKENS + q*codebook_size
+        per_cb = (torch.arange(Q, device=seed_codes.device) * self.codebook_size
+                  + NUM_RESERVED_TOKENS).view(1, 1, Q)
+        unique = seed_codes.to(torch.long) + per_cb            # [1,N,Q] global ids
+        N = unique.shape[1]
+        for step in range(max(0, N - 1)):
+            dec.step_f(dstate, source_frame, forced=unique[:, step:step + 1, :],
+                       temporal_step=self._temporal_step, depth_step=self._depth_step)
+        if N > 0:
+            dstate["prev"] = unique[:, N - 1:N, :]             # seed last frame, no model call
+        return unique
+
+    @torch.no_grad()
+    def decode_stream(self, new_codes, state):
+        """Incremental codec decode of new token frames [b, t_new, Q] -> audio [b, N, 2].
+        FLOP-optimal stateful streaming (no overlap-save re-decode); bf16-equivalent to
+        _decode_stream, with a 1-frame (40ms) decoder latency. `state` starts as {}."""
+        codes = convert_from_unique_codes(new_codes, self.codebook_size)
+        emb = codes_to_embeddings(codes, self.quant)
+        return self.dec.decode_streaming(emb.to(self.dtype), state)
+
     @torch.no_grad()
     def stream_session(self, control, chunk_frames=10, max_seconds=55.0,
                        seed=0, time_fn=None, sleep_fn=None, notes=None, drums=None):

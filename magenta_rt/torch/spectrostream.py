@@ -222,6 +222,100 @@ class SpectroStreamDecoder(nn.Module):
         x = self.decode_embeddings(emb)
         return self._istft(x)
 
+    # ---- streaming decode (per-frame, stateful) — bit-exact-in-bf16 vs forward,
+    #      FLOP-optimal (no overlap-save re-decode). state = mutable dict of caches. ----
+    def _s_conv2d(self, x, prefix, kh, kw, st, key, strides=(1, 1), dil=(1, 1)):
+        pt = _semicausal_pad(kh, strides[0], dil[0])
+        pf = _sym_freq_pad(kw, strides[1], dil[1])
+        c = st.get(key)
+        if c is None:
+            c = x.new_zeros(x.shape[0], x.shape[1], pt[0], x.shape[3])
+        xc = torch.cat([c, x], dim=2)
+        st[key] = xc[:, :, xc.shape[2] - pt[0]:, :] if pt[0] > 0 else c
+        xp = F.pad(xc, (pf[0], pf[1], 0, pt[1]))
+        w = self._g(prefix + "/conv/kernel"); b = self._g(prefix + "/conv/bias")
+        return F.conv2d(xp, w.permute(3, 2, 0, 1).to(x.dtype), bias=b.to(x.dtype),
+                        stride=strides, dilation=dil)
+
+    def _s_conv_transpose(self, x, prefix, kh, kw, strides, st, key):
+        sh, sw = strides
+        pt = _transpose_pad(kh, sh, "causal"); pf = _transpose_pad(kw, sw, "same")
+        ctx = (pt[0] + sh - 1) // sh + 1
+        c = st.get(key)
+        if c is None:
+            c = x.new_zeros(x.shape[0], x.shape[1], ctx, x.shape[3])
+        C = x.shape[2]
+        xc = torch.cat([c, x], dim=2)
+        st[key] = xc[:, :, xc.shape[2] - ctx:, :]
+        xp = F.pad(_dilate2d(xc, strides), (pf[0], pf[1], pt[0], pt[1]))
+        w = self._g(prefix + "/conv/kernel"); b = self._g(prefix + "/conv/bias")
+        out = F.conv2d(xp, w.permute(3, 2, 0, 1).to(x.dtype), bias=b.to(x.dtype), stride=1)
+        return out[:, :, out.shape[2] - C * sh:, :]
+
+    def _s_resunit(self, x, prefix, strides, transposed, kt, st, key):
+        inp = x; y = elu(x)
+        if transposed:
+            kh, kw = kt
+            y = self._s_conv_transpose(y, prefix + "/conv2dtranspose_%dx%d" % (kh, kw), kh, kw, strides, st, key + "/ct")
+        else:
+            y = self._s_conv2d(y, prefix + "/conv2d_3x3_a", 3, 3, st, key + "/a")
+        y = elu(y)
+        y = self._s_conv2d(y, prefix + "/conv2d_3x3", 3, 3, st, key + "/b")
+        sc = inp
+        if (prefix + "/shortcut_layer/conv1x1/conv/kernel").replace("/", "__") in self.w:
+            sc = self._conv1x1(sc, prefix + "/shortcut_layer/conv1x1")
+        if strides != (1, 1):
+            sc = self._upsample(sc, strides)
+        return y + sc
+
+    def _s_decode_emb(self, emb_new, st):
+        b, t, _ = emb_new.shape
+        x = emb_new.permute(0, 2, 1).unsqueeze(-1)
+        main = self._conv1x1(x, "input_layer/conv1x1_first")
+        sc = self._conv1x1(x, "input_layer/shortcut_layer/conv1x1_b1"); sc = elu(sc)
+        sc = self._conv1x1(sc, "input_layer/shortcut_layer/conv1x1_b2")
+        x = (main + sc).squeeze(-1).view(b, INPUT_BINS, INPUT_CHANNELS, t).permute(0, 2, 3, 1)
+        x = self._s_resunit(x, "input_layers_residual_unit", (1, 1), False, None, st, "ilru")
+        rev = RATIOS[::-1]
+        x = self._s_resunit(x, "decoder_0", rev[0], True, (max(3, 2 * rev[0][0]), max(3, 2 * rev[0][1])), st, "d0")
+        outs = []
+        for gi, g in enumerate(torch.chunk(x, CHANNEL_SPLITS, dim=1)):
+            h = g
+            for i in range(1, len(RATIOS)):
+                s = rev[i]
+                h = self._s_resunit(h, f"decoder_{i}", s, True, (max(3, 2 * s[0]), max(3, 2 * s[1])), st, f"g{gi}/d{i}")
+            h = elu(h)
+            h = self._s_conv2d(h, "output_layer/base_conv_last", 7, 7, st, f"g{gi}/out")
+            outs.append(h)
+        return torch.cat(outs, dim=1)
+
+    def _s_istft(self, xnew, st):
+        v = xnew.permute(0, 2, 3, 1).contiguous(); b, T, nb, nc = v.shape
+        if T == 0:
+            return xnew.new_zeros(b, 0, 2)
+        v = F.pad(v, (0, 0, 0, 1)).float()
+        comp = torch.view_as_complex(v.view(b, T, 481, nc // 2, 2).contiguous())
+        frames = torch.fft.irfft(comp, n=FFT_LENGTH, dim=2) * self.inv_window.view(1, 1, FRAME_LENGTH, 1)
+        fr = frames.permute(0, 3, 1, 2)
+        tail = st.get("_tail")
+        if tail is None:
+            tail = fr.new_zeros(b, 2, FRAME_STEP)
+        emits = []
+        for i in range(T):
+            f = fr[:, :, i, :]; emits.append(tail + f[:, :, :FRAME_STEP]); tail = f[:, :, FRAME_STEP:]
+        st["_tail"] = tail
+        return torch.cat(emits, dim=2).permute(0, 2, 1)
+
+    def decode_streaming(self, emb_new, state):
+        """Incremental decode. `state` is a mutable dict (start with {}). Returns the
+        newly-available audio [b, N, 2] for `emb_new` [b, t_new, 256], carrying overlap
+        + per-layer conv state across calls. Output == forward(full_emb), 1 frame latency."""
+        x = self._s_decode_emb(emb_new, state)
+        wm = state.get("_warm", DECODER_LOOKAHEAD * TOTAL_TIME_STRIDE)
+        if wm > 0:
+            d = min(wm, x.shape[2]); x = x[:, :, d:, :]; state["_warm"] = wm - d
+        return self._s_istft(x, state)
+
     def _istft(self, x):
         v = x.permute(0, 2, 3, 1).contiguous()      # [b,T,480,4]
         b, T, nb, nc = v.shape
