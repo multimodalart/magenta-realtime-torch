@@ -143,7 +143,7 @@ class EncoderEmbedding(nn.Module):
         m = cfg.musiccoca_rvq
         self.m = m
         # mulan branch
-        self.mulan_offset = torch.arange(m) * cfg.musiccoca_per_rvq_vocab
+        self.register_buffer("mulan_offset", torch.arange(m) * cfg.musiccoca_per_rvq_vocab)
         self.mulan_dequantizer = nn.Parameter(
             torch.zeros(m * cfg.musiccoca_per_rvq_vocab, cfg.musiccoca_embed_dim))
         self.mulan_adapter = L.JaxLinear(cfg.musiccoca_embed_dim, cfg.encoder_model_dims, use_bias=False)
@@ -155,7 +155,7 @@ class EncoderEmbedding(nn.Module):
         offs = [0]
         for p in per[:-1]:
             offs.append(offs[-1] + p)
-        self.register_buffer("regular_offsets", torch.tensor(offs, dtype=torch.long), persistent=False)
+        self.register_buffer("regular_offsets", torch.tensor(offs, dtype=torch.long))
         self.encoder_ln = L.LayerNorm(cfg.encoder_model_dims)
 
     def forward(self, x):

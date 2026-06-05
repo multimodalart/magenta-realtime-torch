@@ -108,7 +108,8 @@ class MusicCoCa:
         if x.ndim == 2:
             x = x.mean(1)
         if sample_rate != AUDIO_SR:
-            import resampy
+            import importlib
+            resampy = importlib.import_module("resampy")  # optional; off the import graph
             x = resampy.resample(x, sample_rate, AUDIO_SR)
         # split into 10s clips (pad last), embed each, mean-pool
         embs = []

@@ -105,7 +105,8 @@ def compile_step_archives(decoder, inductor_configs=None):
     """Export + AOTI-compile the temporal and depth steps with spaces.aoti_compile.
     Returns {'temporal': bytes, 'depth': bytes} — weight-less graph .pt2 blobs.
     Must run on a GPU (inside @spaces.GPU on ZeroGPU)."""
-    import spaces
+    import importlib
+    spaces = importlib.import_module("spaces")  # optional (ZeroGPU); kept off the import graph
     out = {}
     for name, ep in (("temporal", export_temporal(decoder)),
                      ("depth", export_depth(decoder))):
@@ -117,8 +118,8 @@ def compile_step_archives(decoder, inductor_configs=None):
 def load_compiled_steps(decoder, repo_id=None, local_dir=None, filenames=("temporal.pt2", "depth.pt2")):
     """Load weight-less step graphs and bind them to `decoder`'s own weights.
     Returns (temporal_callable, depth_callable) for step_f(temporal_step=, depth_step=)."""
-    from spaces.zero.torch.aoti import LazyAOTIModel
-    import os
+    import importlib, os
+    LazyAOTIModel = importlib.import_module("spaces.zero.torch.aoti").LazyAOTIModel
     paths = {}
     keys = ("temporal", "depth")
     if local_dir is not None:
