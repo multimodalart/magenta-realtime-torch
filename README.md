@@ -17,6 +17,28 @@ Future updates will support supervised fine-tuning.
 📖 **Full documentation:** https://magenta.github.io/magenta-realtime/
 (or build it locally — see [`docs/README.md`](docs/README.md)).
 
+## 🔦 PyTorch & 🤗 Transformers support
+
+This fork adds a pure-**PyTorch** port of MRT2 — no JAX, no TFLite. Every component
+(Depthformer LLM, SpectroStream neural codec, MusicCoCa style encoder) was reimplemented
+in torch and validated token/bit-exact against the JAX/TFLite reference. It ships a
+`transformers`-compatible model that loads with `trust_remote_code=True`, plus three live
+ZeroGPU web demos.
+
+- **Models (🤗):** [`magenta-community/magenta-realtime-2`](https://huggingface.co/magenta-community/magenta-realtime-2) (base) · [`magenta-community/magenta-realtime-2-small`](https://huggingface.co/magenta-community/magenta-realtime-2-small) (small)
+- **Live demos:** [Jam](https://huggingface.co/spaces/magenta-community/magenta-rt-jam) (note / keyboard control) · [Collider](https://huggingface.co/spaces/magenta-community/magenta-rt-collider) (prompt space) · [Studio](https://huggingface.co/spaces/magenta-community/magenta-rt-studio) (producer controls)
+- **Code:** [`magenta_rt/torch/`](magenta_rt/torch/) in [`multimodalart/magenta-realtime-torch`](https://github.com/multimodalart/magenta-realtime-torch)
+
+```python
+from transformers import AutoModel
+import torch
+model = AutoModel.from_pretrained(
+    "magenta-community/magenta-realtime-2", trust_remote_code=True, dtype=torch.bfloat16
+).to("cuda").eval()
+model.load_processor()
+audio, state = model.generate(style="lo-fi hip hop", frames=50)   # ~2s, 48kHz stereo
+```
+
 ## Repo Highlights
 
 - `magenta_rt/` — Python inference library (JAX / MLX backends).

@@ -11,7 +11,7 @@ export { Settings } from './Settings';
 export { SettingsPanel } from './SettingsPanel';
 export { Knob } from './Knob';
 export { VolumeControl } from './VolumeControl';
-export { TransportControls } from './TransportControls';
+export { TransportControls, ZeroGpuSession } from './TransportControls';
 export { magentaTheme } from './theme';
 export * from './colors';
 export { PromptSurface, calculateWeights } from './PromptSurface';

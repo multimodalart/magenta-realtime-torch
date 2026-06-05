@@ -18,7 +18,7 @@ import { useState, useEffect, useRef, useCallback } from 'react';
 import { PianoKeyboard } from './PianoKeyboard';
 import { JamSlider } from './JamSlider';
 import { JamSliderElastic } from './JamSliderElastic';
-import { MagentaDropdown, MidiSelector, ModelSelector, ResourceOnboardingModal, PROMPT_SUGGESTIONS, INSTRUMENT_SUGGESTIONS, AudioMeter, TimingIndicator, SettingsPanel, GREY_900, ALL_COLORS, DEFAULT_TEMPERATURE, DEFAULT_TOPK, DEFAULT_CFG_NOTES, DEFAULT_CFG_MUSICCOCA, DEFAULT_CFG_DRUMS, DEFAULT_UNMASK_WIDTH, DEFAULT_BUFFER_SIZE, DEFAULT_VOLUME } from '@magenta-rt/common';
+import { MagentaDropdown, ZeroGpuSession, MidiSelector, ModelSelector, ResourceOnboardingModal, PROMPT_SUGGESTIONS, INSTRUMENT_SUGGESTIONS, AudioMeter, TimingIndicator, SettingsPanel, GREY_900, ALL_COLORS, DEFAULT_TEMPERATURE, DEFAULT_TOPK, DEFAULT_CFG_NOTES, DEFAULT_CFG_MUSICCOCA, DEFAULT_CFG_DRUMS, DEFAULT_UNMASK_WIDTH, DEFAULT_BUFFER_SIZE, DEFAULT_VOLUME } from '@magenta-rt/common';
 import {
   IconButton,
   MenuItem,
@@ -1073,6 +1073,8 @@ function App() {
               >
                 <TuneIcon sx={{ fontSize: 20 }} />
               </IconButton>
+
+              <ZeroGpuSession />
             </div>
 
             {/* Sliders */}

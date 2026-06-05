@@ -14,6 +14,7 @@
  * limitations under the License.
  */
 
+import { useState, useEffect } from 'react';
 import IconButton from '@mui/material/IconButton';
 import Tooltip from '@mui/material/Tooltip';
 import { VolumeControl } from './VolumeControl';
@@ -33,6 +34,34 @@ interface TransportControlsProps {
   showPlay?: boolean;
   showVolume?: boolean;
   isDawPlaying?: boolean;
+}
+
+function postBridge(msg: any) { (window as any).webkit?.messageHandlers?.auHost?.postMessage(msg); }
+
+export function ZeroGpuSession() {
+  const [len, setLen] = useState(120);
+  const [remaining, setRemaining] = useState(120);
+  const [playing, setPlaying] = useState(false);
+  useEffect(() => {
+    const h = (e: any) => {
+      const d = e.detail || {};
+      if (d.len !== undefined) setLen(d.len);
+      if (d.remaining !== undefined) setRemaining(d.remaining);
+      if (d.playing !== undefined) setPlaying(d.playing);
+    };
+    window.addEventListener('mrt-gpu', h);
+    return () => window.removeEventListener('mrt-gpu', h);
+  }, []);
+  const fmt = (s: number) => { s = Math.max(0, Math.floor(s)); return Math.floor(s / 60) + ':' + String(s % 60).padStart(2, '0'); };
+  return (
+    <div title="ZeroGPU session length (1-4 min)" style={{ display: 'flex', alignItems: 'center', gap: '8px', padding: '6px 12px', borderRadius: '999px', background: 'var(--color-raised, #36373a)', fontFamily: "'Google Sans Text', system-ui", fontSize: '12px', fontWeight: 500, color: 'rgba(255,255,255,0.85)', whiteSpace: 'nowrap', flexShrink: 0 }}>
+      <span style={{ color: '#FFC23C', fontSize: '14px', lineHeight: 1 }}>⚡</span>
+      <input type="range" min={60} max={240} step={30} value={len} disabled={playing}
+        onChange={(e) => { const v = +e.target.value; setLen(v); postBridge({ type: 'gpuSession', value: v }); }}
+        style={{ width: '74px', accentColor: '#FFC23C', cursor: 'pointer', opacity: playing ? 0.4 : 1 }} />
+      <span style={{ minWidth: '30px', fontVariantNumeric: 'tabular-nums', color: (playing && remaining < 30) ? '#FF4C8D' : 'rgba(255,255,255,0.85)' }}>{fmt(playing ? remaining : len)}</span>
+    </div>
+  );
 }
 
 export function TransportControls({
@@ -121,6 +150,7 @@ export function TransportControls({
           sliderPosition={volumeSliderPosition}
         />
       )}
+      <ZeroGpuSession />
     </div>
   );
 }
