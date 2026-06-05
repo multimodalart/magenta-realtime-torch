@@ -162,7 +162,17 @@ class MagentaRT2ForConditionalGeneration(MagentaRT2PreTrainedModel):
         self.processor = MusicCoCaProcessor.from_pretrained(repo_id, device=device or str(self._dev))
         return self
 
-    # ---- AOTI ----
+    # ---- speedups ----
+    def compile_steps(self, dynamic=True, **kwargs):
+        """`torch.compile` the hot per-frame step paths (dynamic shapes for the
+        growing KV cache; one-time warmup). Portable — works on any CUDA GPU,
+        unlike the prebuilt AOTI artifacts, which are GPU-arch-specific."""
+        dec = self.depthformer.decoder
+        dec.temporal_body.step = torch.compile(dec.temporal_body.step, dynamic=dynamic, **kwargs)
+        dec._depth_step_logits = torch.compile(dec._depth_step_logits, dynamic=dynamic, **kwargs)
+        return self
+
+    # ---- AOTI (advanced; GPU-arch-specific) ----
     def apply_compiled(self, temporal_step=None, depth_step=None):
         if temporal_step is not None:
             self._temporal_step = temporal_step
