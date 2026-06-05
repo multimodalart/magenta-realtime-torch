@@ -172,7 +172,28 @@ class MagentaRT2ForConditionalGeneration(MagentaRT2PreTrainedModel):
         dec._depth_step_logits = torch.compile(dec._depth_step_logits, dynamic=dynamic, **kwargs)
         return self
 
-    # ---- AOTI (advanced; GPU-arch-specific) ----
+    # ---- AOTI: export your own ahead-of-time graphs (skip runtime compile) ----
+    def export_aoti(self, out_dir):
+        """AOTInductor-compile the per-frame step to `out_dir` (temporal.pt2 +
+        depth.pt2). Run once on your target GPU; the graphs are architecture-
+        specific. Reload with `load_aoti(out_dir)` to generate with no compile-time."""
+        import os
+        from . import aoti
+        os.makedirs(out_dir, exist_ok=True)
+        dec = self.depthformer.decoder
+        torch._inductor.aoti_compile_and_package(
+            aoti.export_temporal(dec), package_path=os.path.join(out_dir, "temporal.pt2"))
+        torch._inductor.aoti_compile_and_package(
+            aoti.export_depth(dec), package_path=os.path.join(out_dir, "depth.pt2"))
+        return out_dir
+
+    def load_aoti(self, out_dir):
+        """Load AOTI step graphs produced by `export_aoti` and use them for generation."""
+        import os
+        t = torch._inductor.aoti_load_package(os.path.join(out_dir, "temporal.pt2"))
+        d = torch._inductor.aoti_load_package(os.path.join(out_dir, "depth.pt2"))
+        return self.apply_compiled(t, d)
+
     def apply_compiled(self, temporal_step=None, depth_step=None):
         if temporal_step is not None:
             self._temporal_step = temporal_step
