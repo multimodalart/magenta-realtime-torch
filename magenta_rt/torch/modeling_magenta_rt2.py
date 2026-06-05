@@ -310,17 +310,15 @@ class MagentaRT2ForConditionalGeneration(MagentaRT2PreTrainedModel):
         if state is None:
             dstate = self.depthformer.decoder.init_streaming_f(1, self._dev, self._dt)
             gen = torch.Generator(device=self._dev).manual_seed(seed)
-            history = torch.zeros((1, 0, c.num_codebooks), dtype=torch.long, device=self._dev)
-            emitted = 0
+            decode_state = self.init_decode_state()
         else:
-            dstate, gen, history, emitted = state["dstate"], state["gen"], state["history"], state["emitted"]
+            dstate, gen, decode_state = state["dstate"], state["gen"], state["decode_state"]
         sampler = make_sampler(temperature, top_k, gen)
         toks = [self.depthformer.decoder.step_f(
             dstate, source, sampler=sampler,
             temporal_step=self._temporal_step, depth_step=self._depth_step) for _ in range(frames)]
-        history = torch.cat([history] + toks, dim=1)
-        audio, emitted = self._decode_stream(history, emitted, flush=flush)
-        new_state = {"dstate": dstate, "gen": gen, "history": history, "emitted": emitted}
+        audio = self.decode_stream(torch.cat(toks, dim=1), decode_state)   # stateful per-frame streaming decode (40ms frames)
+        new_state = {"dstate": dstate, "gen": gen, "decode_state": decode_state}
         wav = audio[0].float().cpu().numpy()
         i16 = _float_to_int16(wav)
         out = i16 if return_int16 else i16.astype(np.float32) / 32768.0
@@ -340,8 +338,8 @@ class MagentaRT2ForConditionalGeneration(MagentaRT2PreTrainedModel):
         drums = drums if drums is not None else [-1] * self.num_drums
         dstate = self.depthformer.decoder.init_streaming_f(1, dev, dt)
         gen = torch.Generator(device=dev).manual_seed(seed)
-        history = torch.zeros((1, 0, c.num_codebooks), dtype=torch.long, device=dev)
-        emitted = 0
+        decode_state = self.init_decode_state()
+        emitted_samples = 0
         cur_tokens = None
         source = None
         t0 = time_fn()
@@ -363,11 +361,11 @@ class MagentaRT2ForConditionalGeneration(MagentaRT2PreTrainedModel):
             toks = [self.depthformer.decoder.step_f(
                 dstate, source, sampler=sampler,
                 temporal_step=self._temporal_step, depth_step=self._depth_step) for _ in range(chunk_frames)]
-            history = torch.cat([history] + toks, dim=1)
-            audio, emitted = self._decode_stream(history, emitted)
+            audio = self.decode_stream(torch.cat(toks, dim=1), decode_state)
+            emitted_samples += audio.shape[1]
             if audio.shape[1] > 0:
                 yield _float_to_int16(audio[0].float().cpu().numpy())
-            ahead = (emitted * FRAME_SAMPLES / SR) - (time_fn() - t0)
+            ahead = (emitted_samples / SR) - (time_fn() - t0)
             if ahead > 1.0:
                 sleep_fn(min(ahead - 1.0, 0.5))
 
