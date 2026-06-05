@@ -256,9 +256,15 @@ class MultivariateDecoder(nn.Module):
         }
 
     def step_f(self, state, source_frame, sampler=None, forced=None,
-               temporal_step=None, depth_step=None):
+               temporal_step=None, depth_step=None, cfg_scales=None):
         """One functional frame. temporal_step/depth_step override the eager fns
-        (e.g. with AOTI-compiled callables). Updates state in place; returns [b,1,Q]."""
+        (e.g. with AOTI-compiled callables). Updates state in place; returns [b,1,Q].
+
+        cfg_scales: optional tuple of classifier-free-guidance scales. When set,
+        `source_frame`/`state` are batched as [positive, neg_1, ...] with
+        arity = 1 + len(cfg_scales); per-codebook logits are combined as
+        ``cond + sum_i scale_i*(cond - neg_i)`` before sampling (the native
+        MLX/.mlxfn path). The single sampled token is broadcast to all rows."""
         cfg = self.cfg
         tstep = temporal_step or self.temporal_step_fn
         dstep = depth_step or self.depth_step_fn
@@ -275,10 +281,21 @@ class MultivariateDecoder(nn.Module):
             logits, depth_kv = dstep(depth_input, depth_kv)
             lo = cfg.num_reserved_tokens + q * cfg.codebook_size
             hi = lo + cfg.codebook_size
-            tok = forced[..., q] if forced is not None else sampler(logits.float(), q, lo, hi)
+            if cfg_scales is not None:                       # classifier-free guidance combine
+                cond = logits[0:1]
+                comb = cond
+                for i, s in enumerate(cfg_scales, start=1):
+                    comb = comb + s * (cond - logits[i:i + 1])
+                tok = forced[..., q] if forced is not None else sampler(comb.float(), q, lo, hi)
+                depth_input = self.embed(tok.expand(logits.shape[0], -1))
+            else:
+                tok = forced[..., q] if forced is not None else sampler(logits.float(), q, lo, hi)
+                depth_input = self.embed(tok)
             samples.append(tok)
-            depth_input = self.embed(tok)
         frame = torch.stack(samples, dim=-1)
+        if cfg_scales is not None:
+            state["prev"] = frame.expand(to.shape[0], -1, -1)
+            return frame[:1]
         state["prev"] = frame
         return frame
 

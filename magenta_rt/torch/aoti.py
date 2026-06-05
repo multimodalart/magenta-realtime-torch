@@ -51,32 +51,46 @@ def _params_ref(decoder):
     return p.device, p.dtype
 
 
+# Example batch for export must be >1 (torch.export specializes size-1 dims);
+# the batch dim itself is dynamic with min=1, so one artifact serves B=1
+# (no guidance) and B>1 (classifier-free guidance: 1 positive + N negatives).
+EXPORT_BATCH = 2
+MAX_CFG_BATCH = 8
+
+
 def temporal_export_inputs(decoder, kv_len=20):
-    """(args, dynamic_shapes) for exporting the temporal step."""
+    """(args, dynamic_shapes) for exporting the temporal step (dynamic batch + KV len)."""
     dev, dt = _params_ref(decoder)
     c = decoder.cfg
     L, nh, uph = c.temporal.num_layers, c.temporal.num_heads, c.temporal.dim_per_head
+    b = EXPORT_BATCH
     prev = torch.randint(c.num_reserved_tokens, c.num_reserved_tokens + c.codebook_size,
-                         (1, 1, c.num_codebooks), device=dev)
-    mk = lambda: [(torch.randn(1, kv_len, nh, uph, device=dev, dtype=dt),
-                   torch.randn(1, kv_len, nh, uph, device=dev, dtype=dt)) for _ in range(L)]
+                         (b, 1, c.num_codebooks), device=dev)
+    mk = lambda: [(torch.randn(b, kv_len, nh, uph, device=dev, dtype=dt),
+                   torch.randn(b, kv_len, nh, uph, device=dev, dtype=dt)) for _ in range(L)]
     self_kv, cross_kv = mk(), mk()
-    source = torch.randn(1, 1, c.encoder_model_dims, device=dev, dtype=dt)
+    source = torch.randn(b, 1, c.encoder_model_dims, device=dev, dtype=dt)
+    B = Dim("B", min=1, max=MAX_CFG_BATCH)
     T = Dim("T", min=0, max=c.temporal_max_past + 1)
-    ds = (None, [({1: T}, {1: T}) for _ in range(L)], [({1: T}, {1: T}) for _ in range(L)], None)
+    ds = ({0: B},
+          [({0: B, 1: T}, {0: B, 1: T}) for _ in range(L)],
+          [({0: B, 1: T}, {0: B, 1: T}) for _ in range(L)],
+          {0: B})
     return (prev, self_kv, cross_kv, source), ds
 
 
 def depth_export_inputs(decoder, kv_len=6):
-    """(args, dynamic_shapes) for exporting the depth step."""
+    """(args, dynamic_shapes) for exporting the depth step (dynamic batch + KV len)."""
     dev, dt = _params_ref(decoder)
     c = decoder.cfg
     L, nh, uph = c.depth.num_layers, c.depth.num_heads, c.depth.dim_per_head
-    depth_input = torch.randn(1, 1, c.temporal.model_dims, device=dev, dtype=dt)
-    depth_kv = [(torch.randn(1, kv_len, nh, uph, device=dev, dtype=dt),
-                 torch.randn(1, kv_len, nh, uph, device=dev, dtype=dt)) for _ in range(L)]
+    b = EXPORT_BATCH
+    depth_input = torch.randn(b, 1, c.temporal.model_dims, device=dev, dtype=dt)
+    depth_kv = [(torch.randn(b, kv_len, nh, uph, device=dev, dtype=dt),
+                 torch.randn(b, kv_len, nh, uph, device=dev, dtype=dt)) for _ in range(L)]
+    B = Dim("B", min=1, max=MAX_CFG_BATCH)
     Td = Dim("Td", min=0, max=c.num_codebooks)
-    ds = (None, [({1: Td}, {1: Td}) for _ in range(L)])
+    ds = ({0: B}, [({0: B, 1: Td}, {0: B, 1: Td}) for _ in range(L)])
     return (depth_input, depth_kv), ds
 
 

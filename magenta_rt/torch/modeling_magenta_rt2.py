@@ -24,6 +24,7 @@ loop is a single token stream). MusicCoCa style encoding is a separate
 
 import json
 import os
+import warnings
 
 import numpy as np
 import torch
@@ -238,6 +239,32 @@ class MagentaRT2ForConditionalGeneration(MagentaRT2PreTrainedModel):
         ]
         return self._conditioning(style_tokens, notes, drums, cfgs)
 
+    def _guidance_source(self, style, notes, drums, cfg_musiccoca, cfg_notes):
+        """OPTIONAL classifier-free-guidance conditioning (the native MLX/.mlxfn path).
+        Builds a 3-row batch [positive, neg_musiccoca, neg_notes] + per-component scales.
+        cfg tokens are neutralized (guidance replaces them); negatives mask style / notes.
+        Returns (source[3,Tc,enc], (cfg_musiccoca, cfg_notes))."""
+        c = self.config
+        if style is None:
+            st = [-1] * self.num_musiccoca
+        elif isinstance(style, (list, np.ndarray)) and np.asarray(style).ndim == 1 \
+                and np.asarray(style).dtype.kind in "iu" and len(style) == self.num_musiccoca:
+            st = list(style)
+        else:
+            st = self._tokenize_style(style)
+        st = (list(st) + [-1] * self.num_musiccoca)[:self.num_musiccoca]
+        notes = notes if notes is not None else [-1] * self.num_notes
+        drums = drums if drums is not None else [-1] * self.num_drums
+        CM = [-1, -1, -1]                                   # neutralized cfg tokens
+        cond   = self._conditioning(st, notes, drums, CM)
+        neg_mc = self._conditioning([-1] * self.num_musiccoca, notes, drums, CM)
+        neg_n  = self._conditioning(st, [-1] * self.num_notes, drums, CM)
+        source = self.depthformer.encode(torch.cat([cond, neg_mc, neg_n], 0)).to(self._dt)
+        cfg_mc = c.cfg_musiccoca if cfg_musiccoca is None else cfg_musiccoca
+        cfg_n = c.cfg_notes if cfg_notes is None else cfg_notes
+        _warn_high_cfg(cfg_mc, cfg_n)
+        return source, (float(cfg_mc), float(cfg_n))
+
     # ---- codec ----
     def _decode_stream(self, history, emitted, context=STREAM_DECODE_CONTEXT,
                        margin=STREAM_DECODE_MARGIN, flush=False):
@@ -301,21 +328,32 @@ class MagentaRT2ForConditionalGeneration(MagentaRT2PreTrainedModel):
     @torch.no_grad()
     def generate(self, style=None, notes=None, drums=None, cfg_musiccoca=None,
                  cfg_notes=None, cfg_drums=None, temperature=None, top_k=None,
-                 frames=25, seed=0, state=None, flush=False, return_int16=False):
+                 frames=25, seed=0, state=None, flush=False, return_int16=False,
+                 guidance=False):
+        """`guidance=False` (default): cfg_* are discretized conditioning tokens — the
+        validated in-process/JAX path, unchanged. `guidance=True`: cfg_musiccoca/cfg_notes
+        become classifier-free-guidance scales (negatives + per-codebook logit combine),
+        matching the native MLX/Mac-app path. Guidance uses eager steps (batch>1)."""
         c = self.config
         temperature = c.temperature if temperature is None else temperature
         top_k = c.top_k if top_k is None else top_k
-        cond = self._resolve_conditioning(style, notes, drums, cfg_musiccoca, cfg_notes, cfg_drums)
-        source = self.depthformer.encode(cond).to(self._dt)
+        if guidance:
+            source, cfg_scales = self._guidance_source(style, notes, drums, cfg_musiccoca, cfg_notes)
+            arity = len(cfg_scales) + 1
+        else:
+            cond = self._resolve_conditioning(style, notes, drums, cfg_musiccoca, cfg_notes, cfg_drums)
+            source = self.depthformer.encode(cond).to(self._dt)
+            cfg_scales, arity = None, 1
         if state is None:
-            dstate = self.depthformer.decoder.init_streaming_f(1, self._dev, self._dt)
+            dstate = self.depthformer.decoder.init_streaming_f(arity, self._dev, self._dt)
             gen = torch.Generator(device=self._dev).manual_seed(seed)
             decode_state = self.init_decode_state()
         else:
             dstate, gen, decode_state = state["dstate"], state["gen"], state["decode_state"]
         sampler = make_sampler(temperature, top_k, gen)
+        # dynamic-batch AOTI (or eager fallback) handles guidance B>1 and no-guidance B=1 alike.
         toks = [self.depthformer.decoder.step_f(
-            dstate, source, sampler=sampler,
+            dstate, source, sampler=sampler, cfg_scales=cfg_scales,
             temporal_step=self._temporal_step, depth_step=self._depth_step) for _ in range(frames)]
         audio = self.decode_stream(torch.cat(toks, dim=1), decode_state)   # stateful per-frame streaming decode (40ms frames)
         new_state = {"dstate": dstate, "gen": gen, "decode_state": decode_state}
@@ -326,9 +364,19 @@ class MagentaRT2ForConditionalGeneration(MagentaRT2PreTrainedModel):
 
     @torch.no_grad()
     def stream(self, control, chunk_frames=10, max_seconds=55.0, seed=0,
-               time_fn=None, sleep_fn=None, notes=None, drums=None):
+               time_fn=None, sleep_fn=None, notes=None, drums=None, guidance=False,
+               cudagraph=False):
         """Continuous generation. `control()` returns {style_tokens, temperature,
-        top_k, cfg_*} read every chunk for mid-stream steering. Yields int16 [N,2]."""
+        top_k, cfg_*} read every chunk for mid-stream steering. Yields int16 [N,2].
+
+        guidance=False (default): cfg_* are conditioning tokens (validated token path,
+        unchanged). guidance=True: cfg_musiccoca/cfg_notes are classifier-free-guidance
+        scales read live every chunk. cudagraph=True: single-dispatch CUDA-graph stepping
+        (one capture at start, ~4-5x faster), steered via static input buffers."""
+        if cudagraph:
+            yield from self._stream_cudagraph(control, chunk_frames, max_seconds, seed,
+                                              time_fn, sleep_fn, notes, drums, guidance)
+            return
         import time as _time
         time_fn = time_fn or _time.time
         sleep_fn = sleep_fn or _time.sleep
@@ -336,7 +384,8 @@ class MagentaRT2ForConditionalGeneration(MagentaRT2PreTrainedModel):
         dev, dt = self._dev, self._dt
         notes = notes if notes is not None else [-1] * self.num_notes
         drums = drums if drums is not None else [-1] * self.num_drums
-        dstate = self.depthformer.decoder.init_streaming_f(1, dev, dt)
+        arity = 3 if guidance else 1
+        dstate = self.depthformer.decoder.init_streaming_f(arity, dev, dt)
         gen = torch.Generator(device=dev).manual_seed(seed)
         decode_state = self.init_decode_state()
         emitted_samples = 0
@@ -351,15 +400,19 @@ class MagentaRT2ForConditionalGeneration(MagentaRT2PreTrainedModel):
             tokens = ctl["style_tokens"]
             if tokens != cur_tokens:
                 cur_tokens = tokens
-                cfgs = [discretize_cfg(ctl.get("cfg_musiccoca", c.cfg_musiccoca), 0.2, 40),
-                        discretize_cfg(ctl.get("cfg_notes", c.cfg_notes), 0.2, 40),
-                        discretize_cfg(ctl.get("cfg_drums", c.cfg_drums), 1.0, 8)]
-                cond = self._conditioning((list(tokens) + [-1] * self.num_musiccoca)[:self.num_musiccoca],
-                                          notes, drums, cfgs)
-                source = self.depthformer.encode(cond).to(dt)
+                st = (list(tokens) + [-1] * self.num_musiccoca)[:self.num_musiccoca]
+                if guidance:                                  # [pos, neg_mc, neg_n]; cfg tokens neutralized
+                    source, _ = self._guidance_source(st, notes, drums, None, None)
+                else:
+                    cfgs = [discretize_cfg(ctl.get("cfg_musiccoca", c.cfg_musiccoca), 0.2, 40),
+                            discretize_cfg(ctl.get("cfg_notes", c.cfg_notes), 0.2, 40),
+                            discretize_cfg(ctl.get("cfg_drums", c.cfg_drums), 1.0, 8)]
+                    source = self.depthformer.encode(self._conditioning(st, notes, drums, cfgs)).to(dt)
+            cfg_scales = ((float(ctl.get("cfg_musiccoca", c.cfg_musiccoca)),     # live scales (unclamped)
+                           float(ctl.get("cfg_notes", c.cfg_notes))) if guidance else None)
             sampler = make_sampler(ctl.get("temperature", c.temperature), ctl.get("top_k", c.top_k), gen)
             toks = [self.depthformer.decoder.step_f(
-                dstate, source, sampler=sampler,
+                dstate, source, sampler=sampler, cfg_scales=cfg_scales,
                 temporal_step=self._temporal_step, depth_step=self._depth_step) for _ in range(chunk_frames)]
             audio = self.decode_stream(torch.cat(toks, dim=1), decode_state)
             emitted_samples += audio.shape[1]
@@ -369,5 +422,242 @@ class MagentaRT2ForConditionalGeneration(MagentaRT2PreTrainedModel):
             if ahead > 1.0:
                 sleep_fn(min(ahead - 1.0, 0.5))
 
+    @torch.no_grad()
+    def _stream_cudagraph(self, control, chunk_frames, max_seconds, seed,
+                          time_fn, sleep_fn, notes, drums, guidance):
+        """CUDA-graph backend for stream(cudagraph=True): one capture at start
+        (warmup ~KEEP frames), then single-dispatch replay per frame. Steering
+        goes through the streamer's static input buffers — cfg/temperature are
+        buffer writes; a style change re-encodes + set_source (windowed ramp)."""
+        import time as _time
+        time_fn = time_fn or _time.time
+        sleep_fn = sleep_fn or _time.sleep
+        c = self.config
+        dt = self._dt
+        notes = notes if notes is not None else [-1] * self.num_notes
+        drums = drums if drums is not None else [-1] * self.num_drums
 
-__all__ = ["MagentaRT2ForConditionalGeneration", "MagentaRT2PreTrainedModel"]
+        def encode_src(tokens, cfg_mc, cfg_n):
+            st = (list(tokens) + [-1] * self.num_musiccoca)[:self.num_musiccoca]
+            if guidance:
+                return self._guidance_source(st, notes, drums, cfg_mc, cfg_n)[0]
+            cfgs = [discretize_cfg(cfg_mc, 0.2, 40), discretize_cfg(cfg_n, 0.2, 40),
+                    discretize_cfg(c.cfg_drums, 1.0, 8)]
+            return self.depthformer.encode(self._conditioning(st, notes, drums, cfgs)).to(dt)
+
+        # bounded wait for the first conditioning, then build + capture the graph
+        t0 = time_fn()
+        ctl = control()
+        while ctl is None and time_fn() - t0 < max_seconds:
+            sleep_fn(0.02); ctl = control()
+        if ctl is None:
+            return
+        cur_tokens = ctl["style_tokens"]
+        cur_cfg = (float(ctl.get("cfg_musiccoca", c.cfg_musiccoca)),
+                   float(ctl.get("cfg_notes", c.cfg_notes)))
+        streamer = self.make_cudagraph_streamer(
+            style=cur_tokens, notes=notes, drums=drums,
+            cfg_musiccoca=cur_cfg[0], cfg_notes=cur_cfg[1],
+            temperature=ctl.get("temperature", c.temperature),
+            top_k=ctl.get("top_k", c.top_k), seed=seed, guidance=guidance)
+        decode_state = self.init_decode_state()
+        emitted_samples = 0
+        t0 = time_fn()
+        while time_fn() - t0 < max_seconds:
+            ctl = control()
+            if ctl is None:
+                sleep_fn(0.005); continue
+            tokens = ctl["style_tokens"]
+            cfg_mc = float(ctl.get("cfg_musiccoca", c.cfg_musiccoca))
+            cfg_n = float(ctl.get("cfg_notes", c.cfg_notes))
+            if guidance:
+                if (cfg_mc, cfg_n) != cur_cfg:
+                    streamer.set_cfg([cfg_mc, cfg_n]); cur_cfg = (cfg_mc, cfg_n)
+                if tokens != cur_tokens:
+                    streamer.set_source(encode_src(tokens, cfg_mc, cfg_n)); cur_tokens = tokens
+            elif tokens != cur_tokens or (cfg_mc, cfg_n) != cur_cfg:   # token path: cfg lives in source
+                streamer.set_source(encode_src(tokens, cfg_mc, cfg_n))
+                cur_tokens, cur_cfg = tokens, (cfg_mc, cfg_n)
+            streamer.set_temperature(ctl.get("temperature", c.temperature))
+            toks = [streamer.step() for _ in range(chunk_frames)]
+            audio = self.decode_stream(torch.cat(toks, dim=1), decode_state)
+            emitted_samples += audio.shape[1]
+            if audio.shape[1] > 0:
+                yield _float_to_int16(audio[0].float().cpu().numpy())
+            ahead = (emitted_samples / SR) - (time_fn() - t0)
+            if ahead > 1.0:
+                sleep_fn(min(ahead - 1.0, 0.5))
+
+    @torch.no_grad()
+    def make_cudagraph_streamer(self, style=None, notes=None, drums=None,
+                                cfg_musiccoca=None, cfg_notes=None, cfg_drums=None,
+                                temperature=None, top_k=None, seed=0, guidance=False,
+                                warmup=None):
+        """One-dispatch-per-frame CUDA-graph streaming: captures the whole frame
+        (temporal + N-codebook depth + in-graph sampler + optional CFG) as a single
+        `torch.cuda.graph` replay over fixed-size static KV buffers — ~MLX `.mlxfn`.
+        Returns a `CudaGraphStreamer`; call `.step()` for the next frame [1,1,Q]
+        (decode with `decode_stream`), and `.set_cfg/.set_temperature/.set_source`
+        for live steering (no re-capture). `top_k` is fixed at capture time."""
+        if guidance:
+            source, scales = self._guidance_source(style, notes, drums, cfg_musiccoca, cfg_notes)
+            num_neg = len(scales)
+        else:
+            cond = self._resolve_conditioning(style, notes, drums, cfg_musiccoca, cfg_notes, cfg_drums)
+            source = self.depthformer.encode(cond).to(self._dt)
+            scales, num_neg = None, 0
+        return CudaGraphStreamer(self, source, num_neg, scales, temperature, top_k, seed, warmup)
+
+
+# Classifier-free guidance scales above this can run away / collapse the output
+# to silence under *sustained constant* conditioning over long runs (the native
+# UI uses a 0-5 slider, default 2.4). We don't clamp — values pass through to
+# match the native range — but we warn once so the caller knows the risk.
+GUIDANCE_CFG_WARN = 3.5
+
+
+def _warn_high_cfg(*scales):
+    hi = [round(float(s), 2) for s in scales if float(s) > GUIDANCE_CFG_WARN]
+    if hi:
+        warnings.warn(
+            f"CFG guidance scale(s) {hi} exceed ~{GUIDANCE_CFG_WARN}; sustained high "
+            "guidance on constant conditioning can make the output run away / collapse "
+            "to silence over long runs. (Changing notes/style during play avoids this.)",
+            stacklevel=3)
+        return True
+    return False
+
+
+class CudaGraphStreamer:
+    """Single-dispatch CUDA-graph frame stepper over fixed-size static KV buffers.
+
+    Warms `KEEP` frames eagerly to fill the temporal/cross KV to steady state,
+    snapshots them into static buffers, then captures one frame (temporal + depth +
+    sampler) with `torch.cuda.graph`. `.step()` replays it (one GPU dispatch) and
+    returns the new frame tokens. Live steering writes into static input buffers
+    (`source`, `cfg`, `temperature`) — the captured graph reads them, no re-capture.
+    Conditioning changes ramp in via the windowed cross-KV (optional hard flush)."""
+
+    def __init__(self, model, source, num_neg, cfg_scales=None, temperature=None,
+                 top_k=None, seed=0, warmup=None):
+        self.m = model
+        dec = model.depthformer.decoder
+        c = model.config
+        self.dec = dec
+        self.Q, self.CB, self.NR = c.num_codebooks, c.codebook_size, c.num_reserved_tokens
+        self.KEEP = dec.cfg.temporal_max_past + 1
+        self.num_neg = num_neg
+        self.top_k = int(c.top_k if top_k is None else top_k)
+        dev, dt = model._dev, model._dt
+        B = source.shape[0]; self.B = B
+        # live-steering static inputs
+        self.source = source.clone()
+        self.cfg = (torch.zeros(0, device=dev, dtype=torch.float32) if not num_neg
+                    else torch.tensor([float(s) for s in cfg_scales], device=dev, dtype=torch.float32))
+        self.temp = torch.tensor(float(c.temperature if temperature is None else temperature),
+                                 device=dev, dtype=torch.float32)
+        torch.manual_seed(seed)
+        # 1) prime to steady state (KV == KEEP on every layer)
+        st = dec.init_streaming_f(B, dev, dt)
+        K = self.KEEP
+        for _ in range(K + 8 if warmup is None else warmup):
+            to, ns, nc = dec.temporal_step_fn(st["prev"], st["self"], st["cross"], self.source)
+            st["self"] = [(k[:, -K:], v[:, -K:]) for k, v in ns]
+            st["cross"] = [(k[:, -K:], v[:, -K:]) for k, v in nc]
+            frame = self._depth_sample(to)
+            st["prev"] = frame.expand(B, -1, -1)
+        # 2) static KV + state buffers
+        L = len(st["self"]); self.L = L
+        self.SK = [st["self"][i][0].clone() for i in range(L)]; self.SV = [st["self"][i][1].clone() for i in range(L)]
+        self.CK = [st["cross"][i][0].clone() for i in range(L)]; self.CV = [st["cross"][i][1].clone() for i in range(L)]
+        self.prev = st["prev"].clone()
+        self.out = torch.zeros(1, 1, self.Q, dtype=torch.long, device=dev)
+        # 3) capture (side-stream warmup is required before graph capture)
+        s = torch.cuda.Stream(); s.wait_stream(torch.cuda.current_stream())
+        with torch.cuda.stream(s):
+            for _ in range(3):
+                self._frame_static()
+        torch.cuda.current_stream().wait_stream(s)
+        self.graph = torch.cuda.CUDAGraph()
+        with torch.cuda.graph(self.graph):
+            self._frame_static()
+
+    def _depth_sample(self, to):
+        dec = self.dec; B = self.B; Q, CB, NR = self.Q, self.CB, self.NR
+        dd = dec.cfg.depth
+        z = torch.zeros(B, 0, dd.num_heads, dd.dim_per_head, device=to.device, dtype=to.dtype)
+        dk = [(z, z) for _ in range(dd.num_layers)]
+        di = to; toks = []
+        for q in range(Q):
+            logits, dk = dec.depth_step_fn(di, dk)            # [B,1,V]
+            lo = NR + q * CB
+            ls = logits[..., lo:lo + CB]
+            cond = ls[0:1]; comb = cond
+            for i in range(self.num_neg):                     # classifier-free guidance combine
+                comb = comb + self.cfg[i] * (cond - ls[i + 1:i + 2])
+            kth = torch.topk(comb, self.top_k, dim=-1).values[..., -1:]
+            comb = torch.where(comb >= kth, comb, torch.full_like(comb, -1e9))
+            u = torch.rand(1, 1, CB, device=to.device, dtype=torch.float32)   # graph-safe RNG
+            g = -torch.log(-torch.log(u.clamp(1e-10, 1 - 1e-7)))
+            tok = (comb + g * self.temp).argmax(-1) + lo
+            toks.append(tok)
+            di = dec.embed(tok.expand(B, -1))
+        return torch.stack(toks, dim=-1)                       # [1,1,Q]
+
+    def _frame_static(self):
+        dec = self.dec; K = self.KEEP; L = self.L
+        to, ns, nc = dec.temporal_step_fn(
+            self.prev, [(self.SK[i], self.SV[i]) for i in range(L)],
+            [(self.CK[i], self.CV[i]) for i in range(L)], self.source)
+        for i in range(L):
+            self.SK[i].copy_(ns[i][0][:, -K:]); self.SV[i].copy_(ns[i][1][:, -K:])
+            self.CK[i].copy_(nc[i][0][:, -K:]); self.CV[i].copy_(nc[i][1][:, -K:])
+        frame = self._depth_sample(to)
+        self.out.copy_(frame)
+        self.prev.copy_(frame.expand(self.B, -1, -1))
+
+    # ---- live steering (no re-capture) ----
+    def set_cfg(self, scales):
+        if self.num_neg:
+            if not getattr(self, "_cfg_warned", False):
+                self._cfg_warned = _warn_high_cfg(*scales)
+            self.cfg.copy_(torch.tensor([float(s) for s in scales],
+                                        device=self.cfg.device, dtype=torch.float32))
+
+    def set_temperature(self, t):
+        self.temp.fill_(float(t))
+
+    def set_source(self, source, flush=False):
+        """Update conditioning. Ramps in via the windowed cross-KV; flush=True
+        overwrites all cross-KV slots for an immediate change."""
+        self.source.copy_(source if source.shape[0] == self.B else source.expand(self.B, -1, -1))
+        if flush:
+            for i in range(self.L):
+                sk, sv = self.dec.temporal_body.layers[i]["cross_attention"]._kv(self.source)
+                self.CK[i].copy_(sk[:, -self.KEEP:]); self.CV[i].copy_(sv[:, -self.KEEP:])
+
+    def step(self):
+        """Advance one frame (single CUDA-graph dispatch). Returns tokens [1,1,Q]."""
+        self.graph.replay()
+        return self.out.clone()
+
+    def close(self):
+        """Free the captured CUDA graph + its private memory pool. Idempotent;
+        call at session end (the WS worker should). Safe during interpreter
+        shutdown — swallows teardown-ordering errors."""
+        g = getattr(self, "graph", None)
+        if g is not None:
+            try:
+                g.reset()
+            except Exception:
+                pass
+            self.graph = None
+
+    def __del__(self):
+        try:
+            self.close()
+        except Exception:
+            pass
+
+
+__all__ = ["MagentaRT2ForConditionalGeneration", "MagentaRT2PreTrainedModel", "CudaGraphStreamer"]
