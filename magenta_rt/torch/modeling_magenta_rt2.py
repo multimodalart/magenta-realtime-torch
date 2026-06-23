@@ -209,11 +209,21 @@ class MagentaRT2ForConditionalGeneration(MagentaRT2PreTrainedModel):
         return self.apply_compiled(t, d)
 
     # ---- conditioning ----
-    def _tokenize_style(self, style):
+    def _tokenize_style(self, style, pca_coeffs=None):
         if self.processor is None:
             raise ValueError("No MusicCoCaProcessor attached; pass `style` as a list of "
                              f"{self.num_musiccoca} RVQ token ids, or call set_processor().")
-        return np.asarray(self.processor.tokenize(self.processor.embed(style))).tolist()
+        return np.asarray(self.processor.tokenize(self.processor.embed(style), pca_coeffs)).tolist()
+
+    def set_pca(self, components):
+        if self.processor is None:
+            raise ValueError("No MusicCoCaProcessor attached; call load_processor() first.")
+        return self.processor.set_pca(components)
+
+    def compute_pca(self, texts, k=8):
+        if self.processor is None:
+            raise ValueError("No MusicCoCaProcessor attached; call load_processor() first.")
+        return self.processor.compute_pca(texts, k)
 
     def _conditioning(self, style_tokens, notes, drums, cfgs):
         offset = self.num_reserved_tokens + 1
@@ -221,7 +231,7 @@ class MagentaRT2ForConditionalGeneration(MagentaRT2PreTrainedModel):
         arr = np.array(vals, dtype=np.int64) + offset
         return torch.from_numpy(arr).view(1, 1, -1).to(self._dev)
 
-    def _resolve_conditioning(self, style, notes, drums, cfg_musiccoca, cfg_notes, cfg_drums):
+    def _resolve_conditioning(self, style, notes, drums, cfg_musiccoca, cfg_notes, cfg_drums, pca_coeffs=None):
         c = self.config
         if style is None:
             style_tokens = [-1] * self.num_musiccoca
@@ -229,7 +239,7 @@ class MagentaRT2ForConditionalGeneration(MagentaRT2PreTrainedModel):
                 and np.asarray(style).dtype.kind in "iu" and len(style) == self.num_musiccoca:
             style_tokens = list(style)
         else:
-            style_tokens = self._tokenize_style(style)
+            style_tokens = self._tokenize_style(style, pca_coeffs)
         style_tokens = (list(style_tokens) + [-1] * self.num_musiccoca)[:self.num_musiccoca]
         notes = notes if notes is not None else [-1] * self.num_notes
         drums = drums if drums is not None else [-1] * self.num_drums
@@ -240,7 +250,7 @@ class MagentaRT2ForConditionalGeneration(MagentaRT2PreTrainedModel):
         ]
         return self._conditioning(style_tokens, notes, drums, cfgs)
 
-    def _guidance_source(self, style, notes, drums, cfg_musiccoca, cfg_notes):
+    def _guidance_source(self, style, notes, drums, cfg_musiccoca, cfg_notes, pca_coeffs=None):
         """OPTIONAL classifier-free-guidance conditioning (the native MLX/.mlxfn path).
         Builds a 3-row batch [positive, neg_musiccoca, neg_notes] + per-component scales.
         cfg tokens are neutralized (guidance replaces them); negatives mask style / notes.
@@ -252,7 +262,7 @@ class MagentaRT2ForConditionalGeneration(MagentaRT2PreTrainedModel):
                 and np.asarray(style).dtype.kind in "iu" and len(style) == self.num_musiccoca:
             st = list(style)
         else:
-            st = self._tokenize_style(style)
+            st = self._tokenize_style(style, pca_coeffs)
         st = (list(st) + [-1] * self.num_musiccoca)[:self.num_musiccoca]
         notes = notes if notes is not None else [-1] * self.num_notes
         drums = drums if drums is not None else [-1] * self.num_drums
@@ -330,19 +340,20 @@ class MagentaRT2ForConditionalGeneration(MagentaRT2PreTrainedModel):
     def generate(self, style=None, notes=None, drums=None, cfg_musiccoca=None,
                  cfg_notes=None, cfg_drums=None, temperature=None, top_k=None,
                  frames=25, seed=0, state=None, flush=False, return_int16=False,
-                 guidance=False):
+                 guidance=False, pca_coeffs=None):
         """`guidance=False` (default): cfg_* are discretized conditioning tokens — the
         validated in-process/JAX path, unchanged. `guidance=True`: cfg_musiccoca/cfg_notes
         become classifier-free-guidance scales (negatives + per-codebook logit combine),
-        matching the native MLX/Mac-app path. Guidance uses eager steps (batch>1)."""
+        matching the native MLX/Mac-app path. Guidance uses eager steps (batch>1).
+        pca_coeffs: optional style shift along the MusicCoCa PCA basis (see compute_pca)."""
         c = self.config
         temperature = c.temperature if temperature is None else temperature
         top_k = c.top_k if top_k is None else top_k
         if guidance:
-            source, cfg_scales = self._guidance_source(style, notes, drums, cfg_musiccoca, cfg_notes)
+            source, cfg_scales = self._guidance_source(style, notes, drums, cfg_musiccoca, cfg_notes, pca_coeffs)
             arity = len(cfg_scales) + 1
         else:
-            cond = self._resolve_conditioning(style, notes, drums, cfg_musiccoca, cfg_notes, cfg_drums)
+            cond = self._resolve_conditioning(style, notes, drums, cfg_musiccoca, cfg_notes, cfg_drums, pca_coeffs)
             source = self.depthformer.encode(cond).to(self._dt)
             cfg_scales, arity = None, 1
         if state is None:

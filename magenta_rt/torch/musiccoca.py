@@ -61,6 +61,7 @@ class MusicCoCa:
         self._hann = None
         self._resource_dir = resource_dir
         self._repo_id = repo_id
+        self.pca_basis = None  # [K,768] PCA axes for style steering
 
     def _ensure_audio(self):
         if self._me is not None:
@@ -147,13 +148,32 @@ class MusicCoCa:
         return self.embed_audio(obj, AUDIO_SR)
 
     @torch.no_grad()
-    def tokenize(self, embedding):
+    def tokenize(self, embedding, pca_coeffs=None):
         """[768] embedding -> [12] int RVQ tokens (np.int64). Accepts np or torch.
-        For layering, pass a (weighted) mean of several embeddings."""
+        For layering, pass a (weighted) mean of several embeddings.
+        pca_coeffs: optional [K] shift along self.pca_basis before quantizing."""
         if isinstance(embedding, np.ndarray):
             embedding = torch.from_numpy(embedding)
         embedding = embedding.to(self.device).reshape(1, EMBEDDING_DIM).float()
+        if pca_coeffs is not None and self.pca_basis is not None:
+            c = torch.as_tensor(pca_coeffs, dtype=torch.float32, device=self.device).reshape(-1)
+            k = min(c.numel(), self.pca_basis.shape[0])
+            embedding = embedding + (c[:k] @ self.pca_basis[:k]).reshape(1, EMBEDDING_DIM)
         return self._q(embedding).reshape(-1).cpu().numpy().astype(np.int64)
+
+    def set_pca(self, components):
+        """components: [K,768] PCA basis. Steer style via tokenize(emb, pca_coeffs=[...])."""
+        self.pca_basis = torch.as_tensor(components, dtype=torch.float32,
+                                         device=self.device).reshape(-1, EMBEDDING_DIM)
+        return self.pca_basis
+
+    @torch.no_grad()
+    def compute_pca(self, texts, k=8):
+        """Fit a PCA basis from a corpus of style prompts; sets + returns self.pca_basis [k,768]."""
+        embs = torch.stack([self.embed(t).float() for t in texts])  # [N,768]
+        q = min(k, embs.shape[0] - 1, EMBEDDING_DIM)
+        _, _, V = torch.pca_lowrank(embs - embs.mean(0, keepdim=True), q=q)
+        return self.set_pca(V.t().contiguous())  # [q,768]
 
     def embed_tokens(self, text):
         """Convenience: text -> 12 style tokens (list[int])."""

@@ -144,8 +144,14 @@ class MagentaRT2:
     def embed_style(self, text_or_audio, **kw):
         return self.style_model.embed(text_or_audio, **kw)
 
-    def tokenize_style(self, embedding):
-        return self.style_model.tokenize(embedding)
+    def tokenize_style(self, embedding, pca_coeffs=None):
+        return self.style_model.tokenize(embedding, pca_coeffs)
+
+    def set_pca(self, components):
+        return self.style_model.set_pca(components)
+
+    def compute_pca(self, texts, k=8):
+        return self.style_model.compute_pca(texts, k)
 
     # ---- conditioning ----
     def _conditioning(self, style_tokens, notes, drums, cfgs):
@@ -154,13 +160,13 @@ class MagentaRT2:
         arr = np.array(vals, dtype=np.int64) + offset
         return torch.from_numpy(arr).view(1, 1, -1).to(self.device)
 
-    def _resolve_conditioning(self, style, notes, drums, cfg_musiccoca, cfg_notes, cfg_drums):
+    def _resolve_conditioning(self, style, notes, drums, cfg_musiccoca, cfg_notes, cfg_drums, pca_coeffs=None):
         if style is None:
             style_tokens = [-1] * self.num_musiccoca
         elif isinstance(style, (list, np.ndarray)) and len(np.asarray(style).shape) == 1 and np.asarray(style).dtype.kind in "iu" and len(style) == self.num_musiccoca:
             style_tokens = list(style)
         else:
-            style_tokens = self.tokenize_style(style).tolist()
+            style_tokens = self.tokenize_style(style, pca_coeffs).tolist()
         style_tokens = (style_tokens + [-1] * self.num_musiccoca)[:self.num_musiccoca]
         notes = notes if notes is not None else [-1] * self.num_notes
         drums = drums if drums is not None else [-1] * self.num_drums
@@ -285,7 +291,8 @@ class MagentaRT2:
     @torch.no_grad()
     def generate(self, style=None, notes=None, drums=None, cfg_musiccoca=None,
                  cfg_notes=None, cfg_drums=None, temperature=None, top_k=None,
-                 frames=25, seed=0, state=None, flush=False, return_int16=False):
+                 frames=25, seed=0, state=None, flush=False, return_int16=False,
+                 pca_coeffs=None):
         """Generate `frames` of audio. Pass the returned `state` back in to
         continue seamlessly (continuous/live generation); conditioning args may
         change between calls to steer the stream. Audio is emitted incrementally
@@ -293,7 +300,7 @@ class MagentaRT2:
         the final call to emit the held-back tail frames."""
         temperature = self.temperature if temperature is None else temperature
         top_k = self.top_k if top_k is None else top_k
-        cond = self._resolve_conditioning(style, notes, drums, cfg_musiccoca, cfg_notes, cfg_drums)
+        cond = self._resolve_conditioning(style, notes, drums, cfg_musiccoca, cfg_notes, cfg_drums, pca_coeffs)
         source = self.model.encode(cond).to(self.dtype)  # constant per frame this call
 
         if state is None:

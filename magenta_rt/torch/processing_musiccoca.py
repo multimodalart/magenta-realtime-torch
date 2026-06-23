@@ -56,9 +56,16 @@ class MusicCoCaProcessor:
         """Text str / audio (Waveform | (samples, sr) | np@16kHz) -> [768] torch."""
         return self._mc.embed(text_or_audio)
 
-    def tokenize(self, embedding):
-        """[768] embedding -> [12] int RVQ tokens (np.int64)."""
-        return self._mc.tokenize(embedding)
+    def tokenize(self, embedding, pca_coeffs=None):
+        """[768] embedding -> [12] int RVQ tokens (np.int64). pca_coeffs: optional
+        [K] shift along the PCA basis (see set_pca/compute_pca)."""
+        return self._mc.tokenize(embedding, pca_coeffs)
+
+    def set_pca(self, components):
+        return self._mc.set_pca(components)
+
+    def compute_pca(self, texts, k=8):
+        return self._mc.compute_pca(texts, k)
 
     def layer(self, prompts, weights=None):
         """Blend several prompts (text/audio) by weighted-mean of embeddings,
