@@ -87,17 +87,18 @@ def _gcs_uri(suffix: str) -> str:
 
 def _get_storage_client():
     """Get a GCS storage client, or exit with a helpful error."""
-    from google.auth.exceptions import DefaultCredentialsError  # noqa: E402
     from google.cloud import storage  # noqa: E402
 
+    # Disable mTLS to prevent "No module named 'OpenSSL'" errors when pyOpenSSL
+    # is not installed in the environment.
+    os.environ.setdefault("GOOGLE_API_USE_CLIENT_CERTIFICATE", "false")
+
     try:
-        return storage.Client(project=_GCP_PROJECT)
-    except DefaultCredentialsError:
+        return storage.Client.create_anonymous_client()
+    except Exception as e:
         click.echo(
             click.style("Error: ", fg="red", bold=True)
-            + "Google Cloud credentials not found.\n"
-            "Please configure Application Default Credentials by running:\n"
-            "  gcloud auth application-default login",
+            + f"Failed to initialize GCS client: {e}",
             err=True,
         )
         sys.exit(1)
@@ -539,6 +540,11 @@ def download(name, download_path, source):
         if name is None:
             click.echo("Cancelled.")
             return
+
+    # Accept a bare model name (e.g. "mrt2_small") as well as a full filename;
+    # checkpoints are always .safetensors, mirroring `mrt models download`.
+    if not name.endswith(".safetensors"):
+        name = f"{name}.safetensors"
 
     # Download the single checkpoint file.
     ckpt_dir.mkdir(parents=True, exist_ok=True)
