@@ -1,4 +1,4 @@
-"""LoRA fine-tuning for Magenta RealTime 2 (torch port), via 🤗 peft.
+"""LoRA fine-tuning for Magenta RealTime 2 (torch port).
 
 Teacher-forced next-token training on the Depthformer:
   audio        --SpectroStream encoder + RVQ-->  target codes [b,T,Q] (global ids)
@@ -11,11 +11,10 @@ Three data modes (per manifest row):
   - midi    : MIDI -> per-frame note vector (CrossAttention is causal, so leak-free)
   - raw     : style+notes+drums masked -> self-supervised continuation
 
-LoRA via peft on the activation-free JaxLinear layers, which we first convert to nn.Linear
-(EXACT: weight = kernel.T) so peft can wrap them. Targets: ffn_layer2 (MLP down),
-depth_input_adapter, to_logits. NOT covered: attention q/k/v/o (fused multi-head params,
-not nn.Linear) and ffn_layer1 (fused gelu) — a v1 limitation; extend by splitting those.
-peft freezes the base; adapters save as standard adapter_model.safetensors + adapter_config.json.
+LoRA (see lora.py) is a torch.nn.utils.parametrize delta on the Depthformer kernels — FULL
+coverage: attention q/k/v/o (3D projection params) + MLP (ffn_layer1/ffn_layer2) +
+depth_input_adapter + to_logits. No peft, no module surgery; merge_and_unload bakes the delta
+back so the merged graph is byte-identical to the base (same perf, AOTI/HF untouched).
 
 Manifest = JSONL, one object per line:
   {"audio": "a.wav"}                      -> raw
@@ -26,12 +25,12 @@ Train:
   python -m magenta_rt.torch.finetune --manifest data.jsonl --model small \\
       --encoder-path ~/.../resources/spectrostream/encoder.safetensors --steps 2000 --out lora_out
 
-Load a trained adapter (the swap MUST be reapplied identically — it is deterministic):
-  from transformers import AutoModel; from peft import PeftModel
-  from magenta_rt.torch.finetune import swap_jaxlinear_to_linear
+Load a trained adapter:
+  from transformers import AutoModel
+  from magenta_rt.torch.lora import from_pretrained, merge_and_unload
   base = AutoModel.from_pretrained(repo, trust_remote_code=True, dtype=torch.bfloat16)
-  swap_jaxlinear_to_linear(base.depthformer)            # same SWAP_SUFFIXES as training
-  model = PeftModel.from_pretrained(base, "lora_out")
+  from_pretrained(base.depthformer, "lora_out")   # base.model for the demo class
+  # merge_and_unload(base.depthformer)             # optional: bake in for deployment
 """
 
 import argparse
@@ -45,13 +44,13 @@ import torch.nn as nn
 import torch.nn.functional as F
 
 from .spectrostream_encoder import load_spectrostream_encoder, rvq_encode
+from .lora import inject_lora, save_pretrained
 
 NUM_RESERVED_TOKENS = 6          # raw code -> global id: code + NUM_RESERVED + q*codebook_size
 NUM_NOTES = 128                  # conditioning note channel (MIDI pitch range)
 NUM_MUSICCOCA = 12               # style RVQ tokens
 SR = 48000
 FPS = 25.0                       # SpectroStream frame rate (40 ms/frame); for MIDI alignment
-SWAP_SUFFIXES = ("ffn_layer2", "depth_input_adapter", "to_logits")  # activation-free JaxLinear
 MODEL_REPOS = {
     "small": "magenta-community/magenta-realtime-2-small",
     "base": "magenta-community/magenta-realtime-2",
@@ -62,29 +61,6 @@ def _dformer(model):
     """Depthformer submodule (transformers class -> `depthformer`, demo class -> `model`).
     Callable: `dformer(target, source) -> logits`; has `.encode` and `.decoder`."""
     return getattr(model, "depthformer", None) or model.model
-
-
-def swap_jaxlinear_to_linear(root, suffixes=SWAP_SUFFIXES):
-    """In-place replace targeted activation-free JaxLinear (kernel [in,out], y=x@kernel+b)
-    with an EXACT nn.Linear (weight = kernel.T). Deterministic — reapply identically before
-    PeftModel.from_pretrained. Skips any JaxLinear with a fused activation. Returns names."""
-    todo, conv = [], []
-    for _, module in root.named_modules():
-        for cname, child in module.named_children():
-            if type(child).__name__ == "JaxLinear" and cname in suffixes:
-                if getattr(child, "activation", None) is not None:
-                    continue                                   # never drop a fused activation
-                todo.append((module, cname, child))
-    for module, cname, jl in todo:
-        in_f, out_f = jl.kernel.shape
-        lin = nn.Linear(in_f, out_f, bias=jl.bias is not None)
-        with torch.no_grad():
-            lin.weight.copy_(jl.kernel.t())                    # x@kernel+b == x@W.T+b
-            if jl.bias is not None:
-                lin.bias.copy_(jl.bias)
-        setattr(module, cname, lin.to(jl.kernel.dtype).to(jl.kernel.device))
-        conv.append(cname)
-    return conv
 
 
 # ---------------------------------------------------------------- audio / midi io
@@ -209,17 +185,16 @@ def compute_loss(model, enc, wav, caption, midi_path, crop, cfgs, device):
 
 
 # ---------------------------------------------------------------- train
-def build_peft_model(model, rank=16, alpha=32, dropout=0.05):
-    """Swap JaxLinear->Linear then wrap with peft LoRA. Returns the PeftModel (base modified
-    in-place, so `_dformer(model)` carries the adapters)."""
-    from peft import LoraConfig, get_peft_model
-    conv = swap_jaxlinear_to_linear(_dformer(model))
-    print(f"swapped {len(conv)} JaxLinear->Linear: {sorted(set(conv))}", flush=True)
-    peft_model = get_peft_model(model, LoraConfig(
-        r=rank, lora_alpha=alpha, lora_dropout=dropout, bias="none",
-        target_modules=list(SWAP_SUFFIXES), task_type=None))
-    peft_model.print_trainable_parameters()
-    return peft_model
+def setup_lora(model, rank=16, alpha=32):
+    """Inject the custom LoRA on the Depthformer (full coverage); freeze base. Returns the
+    trainable LoRA params (base modified in-place, so `_dformer(model)` carries the adapters)."""
+    dformer = _dformer(model)
+    lp = inject_lora(dformer, rank, alpha)
+    tot = sum(p.numel() for p in dformer.parameters())
+    tr = sum(p.numel() for p in lp)
+    print(f"LoRA: {tr:,} / {tot:,} trainable ({100 * tr / tot:.2f}%) "
+          f"— attention + MLP + adapter + to_logits", flush=True)
+    return lp
 
 
 def train(args):
@@ -234,8 +209,7 @@ def train(args):
         model.load_processor()
     enc = load_spectrostream_encoder(args.encoder_path, dtype=torch.float32).to(device)
 
-    peft_model = build_peft_model(model, args.lora_rank, args.lora_alpha, args.lora_dropout)
-    lp = [p for p in peft_model.parameters() if p.requires_grad]
+    lp = setup_lora(model, args.lora_rank, args.lora_alpha)
     opt = torch.optim.AdamW(lp, lr=args.lr, weight_decay=args.weight_decay)
     ds = ManifestDataset(args.manifest, args.clip_seconds)
     cfgs = default_cfgs(args.cfg_musiccoca, args.cfg_notes, args.cfg_drums)
@@ -258,8 +232,8 @@ def train(args):
             if step >= args.steps:
                 break
         if args.save_every and step % args.save_every < 1:
-            peft_model.save_pretrained(os.path.join(args.out, f"step_{step}"))
-    peft_model.save_pretrained(args.out)
+            save_pretrained(_dformer(model), os.path.join(args.out, f"step_{step}"), base_model=path)
+    save_pretrained(_dformer(model), args.out, base_model=path)
     print(f"done -> {args.out}/adapter_model.safetensors", flush=True)
 
 
@@ -274,7 +248,6 @@ def main():
     p.add_argument("--device", default="cuda")
     p.add_argument("--lora-rank", type=int, default=16)
     p.add_argument("--lora-alpha", type=float, default=32.0)
-    p.add_argument("--lora-dropout", type=float, default=0.05)
     p.add_argument("--lr", type=float, default=1e-4)
     p.add_argument("--weight-decay", type=float, default=0.0)
     p.add_argument("--steps", type=int, default=2000)

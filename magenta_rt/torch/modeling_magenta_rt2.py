@@ -332,7 +332,7 @@ class MagentaRT2ForConditionalGeneration(MagentaRT2PreTrainedModel):
         if source is None:
             cond = self._resolve_conditioning(style_tokens, None, None, None, None, None)
             source = self.depthformer.encode(cond).to(self._dt)
-        logits = self.depthformer(target, source)
+        logits = self.depthformer.decoder(target, source)   # MultivariateDecoder.forward(target, source); was self.depthformer(target,source)=Depthformer.forward(cond,target) — swapped slots
         return {"logits": logits, "source": source}
 
     # ---- generation (custom; not GenerationMixin) ----
